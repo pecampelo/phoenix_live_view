@@ -75,7 +75,7 @@ jobs:
 
       - name: Compile & lint dependencies
         run: mix compile --warnings-as-errors
-        if: ${{ matrix.lint }} or ${{ matrix.elixir == 'main' }}
+        if: ${{ matrix.lint || matrix.elixir == 'main' }}
         env:
           MIX_ENV: test
 
@@ -133,10 +133,10 @@ jobs:
       - name: Install dependencies
         run: mix deps.get --only test
 
-      - name: Set up Node.js 20.x
+      - name: Set up Node.js 24.x
         uses: actions/setup-node@v4
         with:
-          node-version: 20.x
+          node-version: 24.x
 
       - name: Restore npm cache
         uses: actions/cache@v4
@@ -146,8 +146,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node-
 
-      - name: setup JS
-        run: npm run setup
+      - name: Install locked npm dependencies
+        run: npm ci
 
       - name: typecheck
         run: npm run build && npm run typecheck:tests
@@ -176,7 +176,7 @@ jobs:
 
     runs-on: ubuntu-latest
     container:
-      image: mcr.microsoft.com/playwright:v1.60.0-noble
+      image: mcr.microsoft.com/playwright:v1.62.0-noble
     env:
       ImageOS: ubuntu22
       HOME: /root
@@ -214,8 +214,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node-
 
-      - name: setup
-        run: npm run setup
+      - name: Install locked npm dependencies
+        run: npm ci
 
       - name: Run e2e tests
         run: npm run e2e:test
@@ -301,13 +301,16 @@ jobs:
           name: e2e-test-results
           path: test/e2e/test-results/
 
-      - name: Set up Node.js 20.x
+      - name: Set up Node.js 24.x
         uses: actions/setup-node@v4
         with:
-          node-version: 20.x
+          node-version: 24.x
+
+      - name: Install locked npm dependencies
+        run: npm ci
 
       - name: Merge coverage reports
-        run: npm install && npm run cover:merge
+        run: npm run cover:merge
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4

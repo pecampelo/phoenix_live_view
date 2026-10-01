@@ -1,5 +1,6 @@
 import {
   PHX_DONE_REFS,
+  PHX_ERROR_REFS,
   PHX_PREFLIGHTED_REFS,
   PHX_UPLOAD_REF,
 } from "./constants";
@@ -41,6 +42,12 @@ export default class LiveUploader {
       }
     });
     return active > 0;
+  }
+
+  static hasUploadErrors(formEl) {
+    return DOM.findUploadInputs(formEl).some(
+      (input) => (input.getAttribute(PHX_ERROR_REFS) || "") !== "",
+    );
   }
 
   static serializeUploads(inputEl) {
@@ -102,8 +109,7 @@ export default class LiveUploader {
   }
 
   static activeFileInputs(formEl) {
-    const fileInputs = DOM.findUploadInputs(formEl);
-    return Array.from(fileInputs).filter(
+    return DOM.findUploadInputs(formEl).filter(
       (el) => el.files && this.activeFiles(el).length > 0,
     );
   }
@@ -115,8 +121,7 @@ export default class LiveUploader {
   }
 
   static inputsAwaitingPreflight(formEl) {
-    const fileInputs = DOM.findUploadInputs(formEl);
-    return Array.from(fileInputs).filter(
+    return DOM.findUploadInputs(formEl).filter(
       (input) => this.filesAwaitingPreflight(input).length > 0,
     );
   }
@@ -153,6 +158,12 @@ export default class LiveUploader {
 
   entries() {
     return this._entries;
+  }
+
+  cancel() {
+    this._entries
+      .filter((entry) => !entry.isDone())
+      .forEach((entry) => entry.cancel());
   }
 
   initAdapterUpload(resp, onError, liveSocket) {

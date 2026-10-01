@@ -1,6 +1,18 @@
 defmodule Phoenix.Component.Declarative do
   @moduledoc false
 
+  @embed_templates_warning """
+  This error commonly occurs when using `embed_templates` alongside function components
+
+  that define attributes. If you have both an embedded template file (e.g., app.html.heex)
+  and a function component with the same name (e.g., def app), you should choose one approach:
+
+    * Use only the embedded template file, or
+    * Use only the function component with attributes
+
+  Having both will cause conflicts as the embedded template is loaded first.
+  """
+
   ## Reserved assigns
 
   # This list should only contain attributes that are given to components by engines
@@ -615,13 +627,21 @@ defmodule Phoenix.Component.Declarative do
     attrs = pop_attrs(env)
 
     validate_misplaced_attrs!(attrs, env.file, fn ->
-      "cannot define attributes without a related function component"
+      """
+      cannot define attributes without a related function component
+
+      #{@embed_templates_warning}
+      """
     end)
 
     slots = pop_slots(env)
 
     validate_misplaced_slots!(slots, env.file, fn ->
-      "cannot define slots without a related function component"
+      """
+      cannot define slots without a related function component
+
+      #{@embed_templates_warning}
+      """
     end)
 
     components = Module.get_attribute(env.module, :__components__)
@@ -652,6 +672,13 @@ defmodule Phoenix.Component.Declarative do
         slot_names = for(slot <- slots, do: slot.name)
         known_keys = attr_names ++ slot_names ++ @reserved_assigns
 
+        assigns_with_defaults =
+          if defaults == [] do
+            quote(do: assigns)
+          else
+            quote(do: Map.merge(%{unquote_splicing(defaults)}, assigns))
+          end
+
         def_body =
           if global_name do
             quote do
@@ -663,20 +690,12 @@ defmodule Phoenix.Component.Declarative do
                   %{} -> Map.merge(unquote(global_default), caller_globals)
                 end
 
-              merged =
-                %{unquote_splicing(defaults)}
-                |> Map.merge(assigns)
-                |> Map.put(:__given__, assigns)
-
+              merged = Map.put(unquote(assigns_with_defaults), :__given__, assigns)
               super(Phoenix.Component.assign(merged, unquote(global_name), globals))
             end
           else
             quote do
-              merged =
-                %{unquote_splicing(defaults)}
-                |> Map.merge(assigns)
-                |> Map.put(:__given__, assigns)
-
+              merged = Map.put(unquote(assigns_with_defaults), :__given__, assigns)
               super(merged)
             end
           end
@@ -1081,12 +1100,16 @@ defmodule Phoenix.Component.Declarative do
       with [%{line: first_attr_line} | _] <- attrs do
         compile_error!(first_attr_line, env.file, """
         attributes must be defined before the first function clause at line #{meta[:line]}
+
+        #{@embed_templates_warning}
         """)
       end
 
       with [%{line: first_slot_line} | _] <- slots do
         compile_error!(first_slot_line, env.file, """
         slots must be defined before the first function clause at line #{meta[:line]}
+
+        #{@embed_templates_warning}
         """)
       end
     end
