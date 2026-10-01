@@ -1,7 +1,20 @@
 import { Socket } from "phoenix";
+import { type LiveViewDiagnostic } from "phoenix_live_view/diagnostics";
+import { PHX_LV_DIAGNOSTIC_EVENT } from "phoenix_live_view/constants";
 import LiveSocket from "phoenix_live_view/live_socket";
+import {
+  RenderingBuffer,
+  ReportingBuffer,
+} from "phoenix_live_view/rendered/buffer";
 import JS from "phoenix_live_view/js";
-import { simulateJoinedView, simulateVisibility } from "./test_helpers";
+import View from "phoenix_live_view/view";
+import { version as liveview_version } from "../../package.json";
+import {
+  liveViewDOM,
+  simulateJoinedView,
+  simulateVisibility,
+  stubChannel,
+} from "./test_helpers";
 
 const container = (num) => global.document.getElementById(`container${num}`);
 
@@ -49,6 +62,28 @@ describe("LiveSocket", () => {
     expect(liveSocket.unloaded).toBe(false);
     expect(liveSocket.bindingPrefix).toBe("phx-");
     expect(liveSocket.prevActive).toBe(null);
+    expect(liveSocket.cascadePhxRemoveOnNavigation).toBe(true);
+  });
+
+  test("selects phx-remove elements for live navigation", () => {
+    const mainEl = container(1)!;
+    mainEl.setAttribute("phx-remove", "[]");
+    mainEl.innerHTML = `
+      <div id="remove-child" phx-remove="[]"></div>
+      <div id="keep-child"></div>
+    `;
+
+    liveSocket = new LiveSocket("/live", Socket);
+    expect(
+      liveSocket.phxRemoveElementsForNavigation(mainEl).map((el) => el.id),
+    ).toEqual(["container1", "remove-child"]);
+
+    liveSocket = new LiveSocket("/live", Socket, {
+      cascadePhxRemoveOnNavigation: false,
+    });
+    expect(
+      liveSocket.phxRemoveElementsForNavigation(mainEl).map((el) => el.id),
+    ).toEqual(["container1"]);
   });
 
   test("viewLogger", async () => {
@@ -57,13 +92,201 @@ describe("LiveSocket", () => {
     expect(liveSocket.viewLogger).toBe(viewLogger);
     liveSocket.connect();
     const view = liveSocket.getViewByEl(container(1));
-    liveSocket.log(view, "updated", () => ["", JSON.stringify("<div>")]);
+    const diagnostics: LiveViewDiagnostic[] = [];
+    const listener = (event: Event) => {
+      diagnostics.push((event as CustomEvent<LiveViewDiagnostic>).detail);
+    };
+    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+    try {
+      liveSocket.log(
+        view,
+        "update",
+        () => ["received diff", JSON.stringify("<div>")],
+        {
+          code: "view.diff-update",
+          metadata: () => ({ diff: "<div>" }),
+        },
+      );
+    } finally {
+      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+    }
     expect(viewLogger).toHaveBeenCalledWith(
       view,
-      "updated",
-      "",
+      "update",
+      "received diff",
       JSON.stringify("<div>"),
     );
+    expect(diagnostics).toEqual([
+      {
+        version: 1,
+        level: "debug",
+        code: "view.diff-update",
+        message: "received diff",
+        viewId: view.id,
+        metadata: { diff: "<div>" },
+        attribution: "unknown",
+      },
+    ]);
+  });
+
+  test("view errors are always emitted and include the view ID", () => {
+    liveSocket = new LiveSocket("/live", Socket);
+    liveSocket.connect();
+    liveSocket.disableDebug();
+    const view = liveSocket.getViewByEl(container(1));
+    const diagnostics: LiveViewDiagnostic[] = [];
+    const listener = (event: Event) => {
+      diagnostics.push((event as CustomEvent<LiveViewDiagnostic>).detail);
+    };
+    const consoleError = jest
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+
+    try {
+      view.logError("view.test-error", "test error", { reason: "test" });
+
+      expect(consoleError).toHaveBeenCalledWith("test error", {
+        reason: "test",
+      });
+      expect(diagnostics).toEqual([
+        {
+          version: 1,
+          level: "error",
+          code: "view.test-error",
+          message: "test error",
+          viewId: view.id,
+          metadata: { reason: "test" },
+          attribution: "unknown",
+        },
+      ]);
+    } finally {
+      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+      consoleError.mockRestore();
+    }
+  });
+
+  test("does not dispatch debug diagnostics for viewLogger when debugging is disabled", () => {
+    const viewLogger = jest.fn();
+    liveSocket = new LiveSocket("/live", Socket, { viewLogger });
+    liveSocket.disableDebug();
+    const view = { id: "view-id" };
+    const listener = jest.fn();
+    const metadata = jest.fn(() => ({ value: 1 }));
+    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+
+    try {
+      liveSocket.log(view, "update", () => ["message", { value: 1 }], {
+        code: "view.diff-update",
+        metadata,
+      });
+    } finally {
+      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+    }
+
+    expect(viewLogger).toHaveBeenCalledWith(view, "update", "message", {
+      value: 1,
+    });
+    expect(metadata).not.toHaveBeenCalled();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  test("dispatches error-level log diagnostics without logging to the console when debugging is disabled", () => {
+    liveSocket = new LiveSocket("/live", Socket);
+    liveSocket.disableDebug();
+    const view = { id: "view-id" };
+    const diagnostics: LiveViewDiagnostic[] = [];
+    const listener = (event: Event) => {
+      diagnostics.push((event as CustomEvent<LiveViewDiagnostic>).detail);
+    };
+    const consoleLog = jest.spyOn(console, "log").mockImplementation(() => {});
+    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+
+    try {
+      liveSocket.log(view, "error", () => ["unable to join", { reason: 1 }], {
+        code: "view.join-failed",
+        level: "error",
+        metadata: () => ({ response: { reason: 1 } }),
+        context: { attribution: "network" },
+      });
+    } finally {
+      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+      consoleLog.mockRestore();
+    }
+
+    expect(consoleLog).not.toHaveBeenCalled();
+    expect(diagnostics).toEqual([
+      {
+        version: 1,
+        level: "error",
+        code: "view.join-failed",
+        message: "unable to join",
+        viewId: "view-id",
+        metadata: { response: { reason: 1 } },
+        attribution: "network",
+      },
+    ]);
+  });
+
+  test("does not evaluate or dispatch debug logs when debugging is disabled", () => {
+    liveSocket = new LiveSocket("/live", Socket);
+    liveSocket.disableDebug();
+    const view = { id: "view-id" };
+    const msgCallback = jest.fn(() => ["message", { value: 1 }]);
+    const listener = jest.fn();
+    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+
+    try {
+      liveSocket.log(view, "update", msgCallback, {
+        code: "view.diff-update",
+      });
+    } finally {
+      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+    }
+
+    expect(msgCallback).not.toHaveBeenCalled();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  test("dispatches enabled console debug logs as diagnostics", () => {
+    liveSocket = new LiveSocket("/live", Socket);
+    liveSocket.enableDebug();
+    const view = { id: "view-id", liveSocket };
+    const metadata = { value: 1 };
+    const diagnostics: LiveViewDiagnostic[] = [];
+    const listener = (event: Event) => {
+      diagnostics.push((event as CustomEvent<LiveViewDiagnostic>).detail);
+    };
+    const consoleLog = jest.spyOn(console, "log").mockImplementation(() => {});
+    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+
+    try {
+      liveSocket.log(view, "update", () => ["received diff", metadata], {
+        code: "view.diff-update",
+        metadata: () => metadata,
+        context: { attribution: "unknown" },
+      });
+
+      expect(consoleLog).toHaveBeenCalledWith(
+        "view-id update: received diff - ",
+        metadata,
+      );
+      expect(diagnostics).toEqual([
+        {
+          version: 1,
+          level: "debug",
+          code: "view.diff-update",
+          message: "received diff",
+          viewId: "view-id",
+          metadata,
+          attribution: "unknown",
+        },
+      ]);
+    } finally {
+      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
+      liveSocket.disableDebug();
+      consoleLog.mockRestore();
+    }
   });
 
   test("connect", async () => {
@@ -79,6 +302,27 @@ describe("LiveSocket", () => {
     liveSocket.disconnect();
 
     expect(liveSocket.getViewByEl(container(1)).destroy).toBeDefined();
+  });
+
+  test("rebinds the server close failsafe after reconnecting", () => {
+    liveSocket = new LiveSocket("/live", Socket);
+    const onClose = jest.spyOn(liveSocket.socket, "onClose");
+    const reloadWithJitter = jest.spyOn(liveSocket, "reloadWithJitter");
+
+    liveSocket.connect();
+    liveSocket.main = liveSocket.getViewByEl(container(1));
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    liveSocket.disconnect();
+    liveSocket.connect();
+    // onClose should be called during each connect(), hence two calls after reconnecting
+    expect(onClose).toHaveBeenCalledTimes(2);
+
+    const serverCloseHandler = onClose.mock.calls[1][0] as (event: {
+      code: number;
+    }) => void;
+    serverCloseHandler({ code: 1000 });
+    expect(reloadWithJitter).toHaveBeenCalledWith(liveSocket.main);
   });
 
   test("channel", async () => {
@@ -467,6 +711,36 @@ describe("liveSocket.js()", () => {
     JS.exec = originalExec;
   });
 
+  test("push does not mutate reusable options", () => {
+    const el = document.createElement("div");
+    const opts = { value: { key: "value" }, target: "#target" };
+    view.el.appendChild(el);
+
+    const originalWithinOwners = liveSocket.withinOwners;
+    liveSocket.withinOwners = (_el, callback) => {
+      callback(view);
+    };
+
+    const originalExec = JS.exec;
+    JS.exec = jest.fn();
+
+    js.push(el, "custom-event", opts);
+    js.push(el, "custom-event", opts);
+
+    expect(opts).toEqual({ value: { key: "value" }, target: "#target" });
+    expect((JS.exec as jest.Mock).mock.calls[0][5][1]).toEqual({
+      data: { key: "value" },
+      target: "#target",
+    });
+    expect((JS.exec as jest.Mock).mock.calls[1][5][1]).toEqual({
+      data: { key: "value" },
+      target: "#target",
+    });
+
+    liveSocket.withinOwners = originalWithinOwners;
+    JS.exec = originalExec;
+  });
+
   test("navigate", () => {
     const originalHistoryRedirect = liveSocket.historyRedirect;
     liveSocket.historyRedirect = jest.fn();
@@ -513,5 +787,88 @@ describe("liveSocket.js()", () => {
     );
 
     liveSocket.pushHistoryPatch = originalPushHistoryPatch;
+  });
+});
+
+describe("liveSocket debug buffers", () => {
+  let liveSocket;
+
+  // A joined view rendering one dynamic, so an update has something to report.
+  const joinView = () => {
+    const view = new View(liveViewDOM(), liveSocket, null, null, null);
+    stubChannel(view);
+    liveSocket.roots[view.id] = view;
+    view.isConnected = () => true;
+    view.onJoin({
+      rendered: { 0: "first", s: ["<div>", "</div>"] },
+      liveview_version,
+    });
+    return view;
+  };
+
+  // A buffer class in the shape a debug tool would install one, reporting what
+  // each render was told about the dynamic it wrote.
+  const recordingBuffer = () => {
+    const changed: boolean[] = [];
+    class Recording extends ReportingBuffer {
+      onExit(frame) {
+        changed.push(frame.changed);
+      }
+    }
+    return { Recording, changed };
+  };
+
+  beforeEach(() => {
+    liveSocket = new LiveSocket("/live", Socket);
+  });
+
+  afterEach(() => {
+    liveSocket && liveSocket.destroyAllViews();
+  });
+
+  test("hands out the buffer base classes without an import", () => {
+    // What tooling holding only a LiveSocket handle needs, since the classes
+    // are not otherwise reachable from a page it did not bundle.
+    expect(liveSocket.buffers).toEqual({ RenderingBuffer, ReportingBuffer });
+  });
+
+  test("returns the class installed until now, to restore it with", () => {
+    const { Recording } = recordingBuffer();
+
+    expect(liveSocket.attachDebugBuffer(Recording)).toBe(RenderingBuffer);
+    expect(liveSocket.attachDebugBuffer(RenderingBuffer)).toBe(Recording);
+    expect(liveSocket.RenderingBuffer).toBe(RenderingBuffer);
+  });
+
+  test("a buffer attached before a view joins renders that join", () => {
+    const { Recording, changed } = recordingBuffer();
+    liveSocket.attachDebugBuffer(Recording);
+
+    joinView();
+
+    // The join has no previous render to compare against, so nothing counts
+    // as changed.
+    expect(changed).toEqual([false]);
+  });
+
+  test("a buffer attached after a view joined is shown its next update", () => {
+    // Nothing is re-rendered to install it, so it sees the page as later
+    // patches reach it — starting with this one.
+    const view = joinView();
+    const { Recording, changed } = recordingBuffer();
+    liveSocket.attachDebugBuffer(Recording);
+
+    view.update({ 0: "second" }, []);
+
+    expect(changed).toEqual([true]);
+    expect(view.el.innerHTML).toContain("second");
+  });
+
+  test("leaves the default buffer in place when nobody attaches one", () => {
+    const view = joinView();
+    view.update({ 0: "second" }, []);
+
+    expect(liveSocket.RenderingBuffer).toBe(RenderingBuffer);
+    expect((view as any).rendered.bufferClass()).toBe(RenderingBuffer);
   });
 });

@@ -8,7 +8,7 @@ defmodule Phoenix.LiveView.Utils do
   # All available mount options
   @mount_opts [:temporary_assigns, :layout]
 
-  @max_flash_age :timer.seconds(60)
+  @max_flash_age 60
 
   @valid_uri_schemes [
     "http:",
@@ -617,14 +617,14 @@ defmodule Phoenix.LiveView.Utils do
   # Returns the lowercased URI scheme of `to` if it begins with one, that is, a
   # ":" appears before any "/", "?" or "#"; otherwise returns nil. This avoids
   # treating a colon in a path segment, query, or fragment as a scheme.
+  defp uri_scheme("/" <> _to), do: nil
+
   defp uri_scheme(to) do
     case :binary.match(to, [":", "/", "?", "#"]) do
-      {pos, 1} ->
-        if binary_part(to, pos, 1) == ":",
-          do: String.downcase(binary_part(to, 0, pos), :ascii),
-          else: nil
+      {pos, 1} when binary_part(to, pos, 1) == ":" ->
+        String.downcase(binary_part(to, 0, pos), :ascii)
 
-      :nomatch ->
+      _ ->
         nil
     end
   end
