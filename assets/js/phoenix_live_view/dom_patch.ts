@@ -8,6 +8,7 @@ import {
   PHX_STATIC,
   PHX_TRIGGER_ACTION,
   PHX_UPDATE,
+  PHX_PATCH_FOCUSED,
   PHX_REF_SRC,
   PHX_REF_LOCK,
   PHX_STREAM,
@@ -136,6 +137,8 @@ export default class DOMPatch {
 
   perform(isJoinPatch) {
     const { view, liveSocket, html, container } = this;
+    const reportError = (code, message, metadata, context?) =>
+      view.logError(code, message, metadata, context);
     let targetContainer = this.targetContainer;
 
     if (this.targetCID) {
@@ -144,7 +147,16 @@ export default class DOMPatch {
       const closestLock = targetContainer.closest(`[${PHX_REF_LOCK}]`);
       // If the targetContainer itself is locked, that's okay.
       // https://github.com/phoenixframework/phoenix_live_view/issues/4088
-      if (closestLock && !closestLock.isSameNode(targetContainer)) {
+      //
+      // A lock outside of this view (e.g. a parent LiveView locking an element that
+      // contains this nested LiveView) is ignored: its cloned tree is only maintained
+      // by the owning view, and undoing the lock does not patch nested LiveViews.
+      // https://github.com/phoenixframework/phoenix_live_view/issues/4444
+      if (
+        closestLock &&
+        !closestLock.isSameNode(targetContainer) &&
+        view.ownsElement(closestLock)
+      ) {
         const clonedTree = DOM.private(closestLock, PHX_REF_LOCK);
         if (clonedTree) {
           // if a parent is locked with a cloned tree, we need to patch the cloned tree instead
@@ -168,6 +180,7 @@ export default class DOMPatch {
     const phxViewportTop = liveSocket.binding(PHX_VIEWPORT_TOP);
     const phxViewportBottom = liveSocket.binding(PHX_VIEWPORT_BOTTOM);
     const phxTriggerExternal = liveSocket.binding(PHX_TRIGGER_ACTION);
+    const phxPatchFocused = liveSocket.binding(PHX_PATCH_FOCUSED);
     const added: Array<Node> = [];
     const updates: Array<Element> = [];
     const appendPrependUpdates: Array<DOMPostMorphRestorer> = [];
@@ -191,6 +204,7 @@ export default class DOMPatch {
         // another case is the recursive patch of a stream item that was kept on reset (-> onBeforeNodeAdded)
         childrenOnly:
           targetContainer.getAttribute(PHX_COMPONENT) === null && !withChildren,
+        keyedRoot: targetContainer.getAttribute(PHX_COMPONENT) != null,
         getNodeKey: (node) => {
           if (!(node instanceof Element)) return null;
           if (DOM.isPhxDestroyed(node)) {
@@ -229,15 +243,15 @@ export default class DOMPatch {
           } else if (streamAt === -1) {
             const lastChild = parent.lastElementChild;
             if (lastChild && !lastChild.hasAttribute(PHX_STREAM_REF)) {
-              const nonStreamChild = Array.from(parent.children).find(
-                (c) => !c.hasAttribute(PHX_STREAM_REF),
+              const nonStreamChild = parent.querySelector(
+                `:scope > :not([${PHX_STREAM_REF}])`,
               );
-              parent.insertBefore(child, nonStreamChild ?? null);
+              parent.insertBefore(child, nonStreamChild);
             } else {
               parent.appendChild(child);
             }
           } else if (streamAt > 0) {
-            const sibling = Array.from(parent.children)[streamAt];
+            const sibling = parent.children[streamAt] ?? null;
             parent.insertBefore(child, sibling);
           }
         },
@@ -300,7 +314,7 @@ export default class DOMPatch {
 
           // data-phx-runtime-hook
           if (el.nodeName === "SCRIPT" && el.hasAttribute(PHX_RUNTIME_HOOK)) {
-            this.handleRuntimeHook(el as HTMLScriptElement, source);
+            el = this.handleRuntimeHook(el as HTMLScriptElement, source);
           }
 
           added.push(el);
@@ -360,17 +374,6 @@ export default class DOMPatch {
           this.maybeReOrderStream(el, false);
         },
         onBeforeElUpdated: (fromEl, toEl) => {
-          // if we are patching the root target container and the id has changed, treat it as a new node
-          // by replacing the fromEl with the toEl, which ensures hooks are torn down and re-created
-          if (
-            fromEl.id &&
-            fromEl.isSameNode(targetContainer) &&
-            fromEl.id !== toEl.id
-          ) {
-            morphCallbacks.onNodeDiscarded!(fromEl);
-            fromEl.replaceWith(toEl);
-            return morphCallbacks.onNodeAdded!(toEl);
-          }
           DOM.syncPendingAttrs(fromEl, toEl);
           DOM.maintainPrivateHooks(
             fromEl,
@@ -378,7 +381,7 @@ export default class DOMPatch {
             phxViewportTop,
             phxViewportBottom,
           );
-          DOM.cleanChildNodes(toEl, phxUpdate);
+          DOM.cleanChildNodes(toEl, phxUpdate, reportError);
           const isFocusedFormEl =
             focused &&
             fromEl.isSameNode(focused) &&
@@ -468,11 +471,13 @@ export default class DOMPatch {
             return false;
           }
 
-          // skip patching focused inputs unless focus is a select that has changed options
+          // skip patching focused inputs unless explicitly opted in or focus is
+          // a select that has changed options
           if (
             isFocusedFormEl &&
             fromEl.type !== "hidden" &&
-            !focusedSelectChanged
+            !focusedSelectChanged &&
+            !toEl.hasAttribute(phxPatchFocused)
           ) {
             this.trackBeforeUpdated(fromEl, toEl);
             DOM.mergeFocusedInput(fromEl, toEl);
@@ -574,15 +579,17 @@ export default class DOMPatch {
     });
 
     if (liveSocket.isDebugEnabled()) {
-      detectDuplicateIds();
-      detectInvalidStreamInserts(this.streamInserts);
+      detectDuplicateIds(reportError);
+      detectInvalidStreamInserts(this.streamInserts, reportError);
       // warn if there are any inputs named "id"
       Array.from(document.querySelectorAll("input[name=id]")).forEach(
         (node) => {
           if (node instanceof HTMLInputElement && node.form) {
-            console.error(
+            reportError(
+              "dom.form-input-name-id",
               'Detected an input with name="id" inside a form! This will cause problems when patching the DOM.\n',
-              node,
+              { el: node },
+              { attribution: "app" },
             );
           }
         },
@@ -858,10 +865,6 @@ export default class DOMPatch {
     DOM.putPrivate(fromEl, PHX_REF_LOCK, DOM.private(toEl, PHX_REF_LOCK));
   }
 
-  private indexOf(parent, child) {
-    return Array.from(parent.children).indexOf(child);
-  }
-
   private teleport(el, morph) {
     const targetSelector = el.getAttribute(PHX_PORTAL);
     const portalContainer = document.querySelector(targetSelector);
@@ -893,7 +896,10 @@ export default class DOMPatch {
       portalTarget = existing;
     } else {
       // create empty target and morph it recursively
-      portalTarget = document.createElement(toTeleport.tagName);
+      portalTarget = document.createElementNS(
+        toTeleport.namespaceURI,
+        toTeleport.localName,
+      );
       portalContainer.appendChild(portalTarget);
     }
     // mark the target as teleported;
@@ -903,7 +909,10 @@ export default class DOMPatch {
     // and we'd need to set it back after each morph
     toTeleport.setAttribute(PHX_TELEPORTED_REF, this.view.id);
     toTeleport.setAttribute(PHX_TELEPORTED_SRC, el.id);
-    morph(portalTarget, toTeleport, true);
+    // We need to clone the element, because in some cases morphdom might
+    // morph the same element multiple times and morphdom modifies the source
+    // element.
+    morph(portalTarget, toTeleport.cloneNode(true), true);
     toTeleport.removeAttribute(PHX_TELEPORTED_REF);
     toTeleport.removeAttribute(PHX_TELEPORTED_SRC);
     // store a reference to the teleported element in the view
@@ -932,6 +941,6 @@ export default class DOMPatch {
       script.nonce = nonce;
     }
     el.replaceWith(script);
-    el = script;
+    return script;
   }
 }

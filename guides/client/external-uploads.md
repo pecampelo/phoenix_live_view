@@ -16,6 +16,40 @@ pre-signed URL, specific to your cloud storage provider, that
 will provide temporary access for the end-user to upload data
 directly to your cloud storage.
 
+## Testing external uploads
+
+Use [`Phoenix.LiveViewTest.render_upload/3`](`Phoenix.LiveViewTest.render_upload/3`)
+to test the server-side external upload flow. It performs the preflight request,
+invokes the function configured by `:external`, and simulates the client reporting
+upload progress:
+
+```elixir
+avatar =
+  file_input(view, "#upload-form", :avatar, [
+    %{name: "avatar.png", content: "file contents", type: "image/png"}
+  ])
+
+assert render_upload(avatar, "avatar.png") =~ "100%"
+assert view |> form("#upload-form") |> render_submit() =~ "uploaded"
+```
+
+`render_upload/3` does not run the configured JavaScript uploader or send the file
+to the external service. Test the JavaScript uploader and its HTTP integration
+separately, for example with a browser-based test.
+
+To inspect only the metadata returned by the preflight request, use
+[`Phoenix.LiveViewTest.preflight_upload/1`](`Phoenix.LiveViewTest.preflight_upload/1`)
+in a separate test:
+
+```elixir
+assert {:ok, %{entries: entries}} = preflight_upload(avatar)
+assert [%{uploader: "S3", url: url}] = Map.values(entries)
+```
+
+`preflight_upload/1` does not acknowledge the response in the simulated upload
+client. Do not call `render_upload/3` afterwards with the same upload;
+`render_upload/3` performs its own preflight request automatically.
+
 ## Chunked HTTP Uploads
 
 For any service that supports large file
@@ -49,8 +83,13 @@ Supply the `:external` option to
 `Phoenix.LiveView.allow_upload/3`. It requires a 2-arity
 function that generates a signed URL where the client will
 push the bytes for the upload entry. This function must
-return either `{:ok, meta, socket}` or `{:error, meta, socket}`,
-where `meta` must be a map.
+return either `{:ok, meta, socket}` or `{:error, error_meta, socket}`,
+where `meta` and `error_meta` must be maps. Returning an error marks the
+entry as failed and makes `{:external_metadata_failure, error_meta}` available
+through `Phoenix.Component.upload_errors/2`. With auto uploads, any remaining
+valid entries continue uploading. For example:
+
+    {:error, %{reason: :presign_failed}, socket}
 
 For example, if you were using a context that provided a
 [`start_session`](https://developers.google.com/youtube/v3/guides/using_resumable_upload_protocol##Start_Resumable_Session)
@@ -84,6 +123,9 @@ Uploaders.UpChunk = function(entries, onViewError){
     // stop uploading in the event of a view error
     onViewError(() => upload.pause())
 
+    // abort the upload if the user cancels it
+    entry.onCancel(() => upload.abort())
+
     // upload error triggers LiveView error
     upload.on("error", (e) => entry.error(e.detail.message))
 
@@ -113,20 +155,23 @@ uploads, consider using chunking as shown above.
 This guide assumes an existing S3 bucket is set up with the correct CORS configuration
 which allows uploading directly to the bucket.
 
-An example CORS config is:
+An example of CORS configuration for client-side uploads would be:
 
 ```json
 [
     {
         "AllowedHeaders": [ "*" ],
         "AllowedMethods": [ "PUT", "POST" ],
-        "AllowedOrigins": [ "*" ],
+        "AllowedOrigins": [ 
+          "https://web.myapp.com",
+          // Add any other domains desired, or * for wildcard.
+        ],
         "ExposeHeaders": []
     }
 ]
 ```
 
-You may put your domain in the "allowedOrigins" instead. More information on configuring CORS for
+You may put any other domain in the "allowedOrigins" instead. More information on configuring CORS for
 S3 buckets is [available on AWS](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ManageCorsUsing.html).
 
 In order to enforce all of your file constraints when uploading to S3,
@@ -189,8 +234,8 @@ Next, we add our JavaScript client-side uploader. The metadata *must* contain th
 `:uploader` key, specifying the name of the JavaScript client-side uploader.
 In this case, it's `"S3"`, as shown above.
 
-Add a new file `uploaders.js` in the following directory `assets/js/` next to `app.js`.
-The content for this `S3` client uploader:
+Add a new file `uploaders.js` in the following directory `assets/js/` next to `app.js`,
+and copy the content below for the `S3` client uploader:
 
 ```javascript
 let Uploaders = {}
@@ -203,6 +248,7 @@ Uploaders.S3 = function(entries, onViewError){
     formData.append("file", entry.file)
     let xhr = new XMLHttpRequest()
     onViewError(() => xhr.abort())
+    entry.onCancel(() => xhr.abort())
     xhr.onload = () => xhr.status === 204 ? entry.progress(100) : entry.error()
     xhr.onerror = () => entry.error()
     xhr.upload.addEventListener("progress", (event) => {
@@ -220,14 +266,14 @@ Uploaders.S3 = function(entries, onViewError){
 export default Uploaders;
 ```
 
-We define an `Uploaders.S3` function, which receives our entries. It then
+We defined an `Uploaders.S3` function, which receives our entries. It then
 performs an AJAX request for each entry, using the `entry.progress()` and
 `entry.error()` functions to report upload events back to the LiveView.
 The name of the uploader must match the one we return on the `:uploader`
 metadata in LiveView.
 
 Finally, head over to `app.js` and add the `uploaders: Uploaders` key to
-the `LiveSocket` constructor to tell phoenix where to find the uploaders returned 
+the `LiveSocket` constructor to tell Phoenix where to find the uploaders returned 
 within the external metadata.
 
 ```javascript
@@ -254,7 +300,7 @@ browser and look at the console or networks tab to view the error logs.
 
 Most S3 compatible platforms like Cloudflare R2 don't support `POST` when
 uploading files so we need to use `PUT` with a signed URL instead of the
-signed `POST`and send the file straight to the service, to do so we need to
+signed `POST` and send the file straight to the service. In order to do so, we need to
 change the `presign_upload/2` function and the `Uploaders.S3` that does the upload.
 
 The new `presign_upload/2`:
@@ -281,6 +327,7 @@ Uploaders.S3 = function (entries, onViewError) {
   entries.forEach(entry => {
     let xhr = new XMLHttpRequest()
     onViewError(() => xhr.abort())
+    entry.onCancel(() => xhr.abort())
     xhr.onload = () => xhr.status === 200 ? entry.progress(100) : entry.error()
     xhr.onerror = () => entry.error()
 

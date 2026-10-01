@@ -13,20 +13,21 @@ import DOM from "./dom";
 
 export default class ElementRef {
   static onUnlock(el, callback) {
-    if (!DOM.isLocked(el) && !el.closest(`[${PHX_REF_LOCK}]`)) {
+    const closestLock = el.closest(`[${PHX_REF_LOCK}]`);
+    if (!closestLock) {
       return callback();
     }
-    const closestLock = el.closest(`[${PHX_REF_LOCK}]`);
-    const ref = closestLock
-      .closest(`[${PHX_REF_LOCK}]`)
-      .getAttribute(PHX_REF_LOCK);
-    closestLock.addEventListener(
-      `phx:undo-lock:${ref}`,
-      () => {
-        callback();
-      },
-      { once: true },
-    );
+    const ref = closestLock.getAttribute(PHX_REF_LOCK);
+    const event = `phx:undo-lock:${ref}`;
+    const onUnlock = (e) => {
+      // Undo events bubble, so only react when this particular lock is undone.
+      // Once it is gone, check again in case the element is nested in another
+      // locked tree.
+      if (e.target !== closestLock) return;
+      closestLock.removeEventListener(event, onUnlock);
+      ElementRef.onUnlock(el, callback);
+    };
+    closestLock.addEventListener(event, onUnlock);
   }
 
   private el: Element;

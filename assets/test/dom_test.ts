@@ -30,6 +30,41 @@ describe("DOM", () => {
     });
   });
 
+  describe("isUnloadableFormSubmit", () => {
+    const submitEvent = (form: HTMLFormElement, submitter: HTMLElement) =>
+      ({
+        target: form,
+        submitter,
+        defaultPrevented: false,
+      }) as unknown as SubmitEvent;
+
+    test("uses the submitter formtarget override", () => {
+      const form = document.createElement("form");
+      const submitter = document.createElement("button");
+      const event = submitEvent(form, submitter);
+
+      expect(DOM.isUnloadableFormSubmit(event)).toBe(true);
+
+      submitter.setAttribute("formtarget", "_blank");
+      expect(DOM.isUnloadableFormSubmit(event)).toBe(false);
+
+      submitter.setAttribute("formtarget", "export");
+      expect(DOM.isUnloadableFormSubmit(event)).toBe(false);
+    });
+
+    test("submitter formtarget takes precedence over the form target", () => {
+      const form = document.createElement("form");
+      const submitter = document.createElement("button");
+      const event = submitEvent(form, submitter);
+
+      form.setAttribute("target", "_blank");
+      expect(DOM.isUnloadableFormSubmit(event)).toBe(false);
+
+      submitter.setAttribute("formtarget", "_self");
+      expect(DOM.isUnloadableFormSubmit(event)).toBe(true);
+    });
+  });
+
   describe("isNewPageClick", () => {
     test("identical locations", () => {
       let currentLoc;
@@ -415,6 +450,23 @@ describe("DOM", () => {
       const button = tag("button", {}, "click me");
       expect(DOM.isEditableInput(button)).toBeFalsy();
     });
+  });
+
+  describe("restoreFocus", () => {
+    test.each(["search", "url", "tel", "password"])(
+      "restores the selection for input type %s",
+      (type) => {
+        const input = tag("input", { type }, "") as HTMLInputElement;
+        input.value = "hello world";
+        document.body.appendChild(input);
+
+        DOM.restoreFocus(input, 2, 5);
+
+        expect(document.activeElement).toBe(input);
+        expect(input.selectionStart).toBe(2);
+        expect(input.selectionEnd).toBe(5);
+      },
+    );
   });
 
   describe("isFormAssociated", () => {

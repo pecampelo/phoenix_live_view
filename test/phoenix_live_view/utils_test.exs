@@ -17,4 +17,38 @@ defmodule Phoenix.LiveView.UtilsTest do
     assert Utils.verify_flash(Endpoint, "bad") == %{}
     assert Utils.verify_flash(Endpoint, nil) == %{}
   end
+
+  test "verify with expired flash token" do
+    token =
+      Phoenix.Token.sign(Endpoint, "flash:" <> Utils.salt!(Endpoint), %{"info" => "hi"},
+        signed_at: System.system_time(:second) - 61
+      )
+
+    assert Utils.verify_flash(Endpoint, token) == %{}
+  end
+
+  test "valid_destination!/2" do
+    assert Utils.valid_destination!("/foo", "")
+    assert Utils.valid_destination!("http://example.com/foo", "")
+
+    assert_raise ArgumentError, fn ->
+      Utils.valid_destination!("javascript:alert('hi')", "")
+    end
+
+    # whitespace does not change the result
+    assert_raise ArgumentError, fn ->
+      Utils.valid_destination!("    javascript:alert('hi')", "")
+    end
+
+    assert_raise ArgumentError, fn ->
+      Utils.valid_destination!("javascript:alert('hi')   ", "")
+    end
+
+    assert_raise ArgumentError, fn ->
+      Utils.valid_destination!("    javascript:alert('hi')   ", "")
+    end
+
+    # can allow custom protocols with tuple syntax, e.g. {:javascript, "..."}
+    assert Utils.valid_destination!({:javascript, "alert('hi')"}, "")
+  end
 end

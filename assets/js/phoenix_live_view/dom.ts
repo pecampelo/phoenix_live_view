@@ -26,7 +26,7 @@ import {
   PHX_STREAM,
 } from "./constants";
 
-import { logError } from "./utils";
+import { logError, type LogError } from "./diagnostics";
 
 export type FormInputLike = HTMLElement & {
   readonly form?: HTMLFormElement | null;
@@ -39,7 +39,15 @@ export type QueryableNode = Element | Document | DocumentFragment;
 
 const DOM = {
   byId(id) {
-    return document.getElementById(id) || logError(`no id found for ${id}`);
+    return (
+      document.getElementById(id) ||
+      logError(
+        "dom.element-not-found",
+        `no id found for ${id}`,
+        { id },
+        { attribution: "internal" },
+      )
+    );
   },
 
   elementFromTarget(target: EventTarget): Element | null {
@@ -73,12 +81,6 @@ const DOM = {
       array.forEach(callback);
     }
     return array;
-  },
-
-  childNodeLength(html) {
-    const template = document.createElement("template");
-    template.innerHTML = html;
-    return template.content.childElementCount;
   },
 
   isUploadInput(el): el is HTMLInputElement {
@@ -134,12 +136,13 @@ const DOM = {
     const isDownload =
       e.target instanceof HTMLAnchorElement &&
       e.target.hasAttribute("download");
-    const isTargetBlank =
-      e.target.hasAttribute("target") &&
-      e.target.getAttribute("target").toLowerCase() === "_blank";
+    const target =
+      e.submitter && e.submitter.hasAttribute("formtarget")
+        ? e.submitter.getAttribute("formtarget")
+        : e.target.getAttribute("target");
+    const isTargetBlank = target !== null && target.toLowerCase() === "_blank";
     const isTargetNamedTab =
-      e.target.hasAttribute("target") &&
-      !e.target.getAttribute("target").startsWith("_");
+      target !== null && target !== "" && !target.startsWith("_");
     return wantsNewTab || isTargetBlank || isDownload || isTargetNamedTab;
   },
 
@@ -362,7 +365,12 @@ const DOM = {
           throttle ? this.deletePrivate(el, THROTTLED) : callback();
         const currentCycle = this.incCycle(el, DEBOUNCE_TRIGGER, trigger);
         if (isNaN(timeout)) {
-          return logError(`invalid throttle/debounce value: ${value}`);
+          return logError(
+            "dom.invalid-debounce",
+            `invalid throttle/debounce value: ${value}`,
+            { el, value },
+            { attribution: "app" },
+          );
         }
         if (throttle) {
           let newKeyDown = false;
@@ -471,10 +479,15 @@ const DOM = {
     if (el.isConnected) {
       el.setAttribute("data-phx-hook", "");
     } else {
-      console.error(`
+      logError(
+        "hook.non-connected-element",
+        `
         hook attached to non-connected DOM element
         ensure you are calling createHook within your connectedCallback. ${el.outerHTML}
-      `);
+      `,
+        { el },
+        { attribution: "app" },
+      );
     }
     this.putPrivate(el, "custom-el-hook", hook);
   },
@@ -551,7 +564,7 @@ const DOM = {
       name === "click"
         ? new MouseEvent("click", eventOpts)
         : new CustomEvent(name, eventOpts);
-    target.dispatchEvent(event);
+    return target.dispatchEvent(event);
   },
 
   cloneNode(node, html) {
@@ -637,7 +650,8 @@ const DOM = {
 
   hasSelectionRange(el): el is HTMLInputElement | HTMLTextAreaElement {
     return (
-      el.setSelectionRange && (el.type === "text" || el.type === "textarea")
+      el.setSelectionRange &&
+      ["text", "textarea", "search", "url", "tel", "password"].includes(el.type)
     );
   },
 
@@ -717,7 +731,11 @@ const DOM = {
     );
   },
 
-  cleanChildNodes(container: Element, phxUpdate: string) {
+  cleanChildNodes(
+    container: Element,
+    phxUpdate: string,
+    reportError: LogError = logError,
+  ) {
     if (
       DOM.isPhxUpdate(container, phxUpdate, ["append", "prepend", PHX_STREAM])
     ) {
@@ -730,9 +748,12 @@ const DOM = {
             childNode.nodeValue &&
             childNode.nodeValue.trim() === "";
           if (!isEmptyTextNode && childNode.nodeType !== Node.COMMENT_NODE) {
-            logError(
+            reportError(
+              "dom.invalid-phx-update-child",
               "only HTML element tags with an id are allowed inside containers with phx-update.\n\n" +
                 `removing illegal node: "${(("outerHTML" in childNode && (childNode.outerHTML as string)) || childNode.nodeValue || "").trim()}"\n\n`,
+              { container, childNode, phxUpdate },
+              { attribution: "app" },
             );
           }
           toRemove.push(childNode);
@@ -791,12 +812,6 @@ const DOM = {
     } else {
       return typeof defaultVal === "function" ? defaultVal() : defaultVal;
     }
-  },
-
-  deleteSticky(el, name) {
-    this.updatePrivate(el, "sticky", [], (ops) => {
-      return ops.filter(([existingName, _]) => existingName !== name);
-    });
   },
 
   putSticky(el, name, op) {

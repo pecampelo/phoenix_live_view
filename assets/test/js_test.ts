@@ -244,6 +244,49 @@ describe("JS", () => {
   });
 
   describe("exec_toggle", () => {
+    test("preserves a zero-duration transition", () => {
+      const view = setupView(`
+      <div id="modal">modal</div>
+      <div id="click"></div>
+      `);
+      const _modal = simulateVisibility(document.querySelector("#modal"));
+      const click = document.querySelector("#click")!;
+
+      JS.exec(
+        event,
+        "click",
+        [
+          [
+            "hide",
+            { to: "#modal", transition: [["fade-out"], [], []], time: 0 },
+          ],
+        ],
+        view,
+        click,
+      );
+      JS.exec(
+        event,
+        "click",
+        [
+          [
+            "add_class",
+            {
+              to: "#modal",
+              names: ["hidden"],
+              transition: [["fade-in"], [], []],
+              time: 0,
+            },
+          ],
+        ],
+        view,
+        click,
+      );
+
+      expect(view.liveSocket["transitions"].size()).toBe(2);
+      jest.advanceTimersByTime(0);
+      expect(view.liveSocket["transitions"].size()).toBe(0);
+    });
+
     test("with defaults", (done) => {
       const view = setupView(`
       <div id="modal">modal</div>
@@ -749,7 +792,12 @@ describe("JS", () => {
           },
           uploads: {},
         });
-        return Promise.resolve({ resp: done(), reply: null, ref: null });
+        return Promise.resolve({
+          type: "ok",
+          resp: done(),
+          reply: null,
+          ref: null,
+        });
       };
       const args = ["push", { _target: input.name, dispatcher: input }];
       JS.exec(
@@ -782,7 +830,12 @@ describe("JS", () => {
           },
           uploads: {},
         });
-        return Promise.resolve({ resp: done(), reply: null, ref: null });
+        return Promise.resolve({
+          type: "ok",
+          resp: done(),
+          reply: null,
+          ref: null,
+        });
       };
       const args = ["push", { _target: input.name, dispatcher: input }];
       JS.exec(
@@ -815,7 +868,12 @@ describe("JS", () => {
           },
           uploads: {},
         });
-        return Promise.resolve({ resp: done(), reply: null, ref: null });
+        return Promise.resolve({
+          type: "ok",
+          resp: done(),
+          reply: null,
+          ref: null,
+        });
       };
       const args = ["push", { _target: input.name, dispatcher: input }];
       JS.exec(
@@ -862,7 +920,12 @@ describe("JS", () => {
           value: "_unused_username=&username=&_unused_other=&other=",
           meta: { _target: "username" },
         });
-        return Promise.resolve({ resp: done(), reply: null, ref: null });
+        return Promise.resolve({
+          type: "ok",
+          resp: done(),
+          reply: null,
+          ref: null,
+        });
       };
       const args = ["push", { _target: input.name, dispatcher: input }];
       JS.exec(
@@ -908,7 +971,12 @@ describe("JS", () => {
           value: "_unused_username=&username=",
           meta: { _target: "username" },
         });
-        return Promise.resolve({ resp: done(), reply: null, ref: null });
+        return Promise.resolve({
+          type: "ok",
+          resp: done(),
+          reply: null,
+          ref: null,
+        });
       };
       const args = ["push", { _target: input.name, dispatcher: input }];
       JS.exec(
@@ -954,7 +1022,12 @@ describe("JS", () => {
           value: "_unused_username=&username=",
           meta: { _target: "username" },
         });
-        return Promise.resolve({ resp: done(), reply: null, ref: null });
+        return Promise.resolve({
+          type: "ok",
+          resp: done(),
+          reply: null,
+          ref: null,
+        });
       };
       const args = ["push", { _target: input.name, dispatcher: input }];
       JS.exec(
@@ -985,7 +1058,12 @@ describe("JS", () => {
           value: "username=&desc=",
           meta: {},
         });
-        return Promise.resolve({ resp: done(), reply: null, ref: null });
+        return Promise.resolve({
+          type: "ok",
+          resp: done(),
+          reply: null,
+          ref: null,
+        });
       };
       JS.exec(event, "submit", form.getAttribute("phx-submit"), view, form, [
         "push",
@@ -1021,7 +1099,12 @@ describe("JS", () => {
             attribute_value: "attribute",
           },
         });
-        return Promise.resolve({ resp: done(), reply: null, ref: null });
+        return Promise.resolve({
+          type: "ok",
+          resp: done(),
+          reply: null,
+          ref: null,
+        });
       };
       JS.exec(event, "submit", form.getAttribute("phx-submit"), view, form, [
         "push",
@@ -1066,7 +1149,12 @@ describe("JS", () => {
 
       view.pushWithReply = (refGenerator, event, payload) => {
         expect(payload.value).toEqual({ one: 1, two: 2, three: "3" });
-        return Promise.resolve({ resp: done(), reply: null, ref: null });
+        return Promise.resolve({
+          type: "ok",
+          resp: done(),
+          reply: null,
+          ref: null,
+        });
       };
       JS.exec(event, "click", click.getAttribute("phx-click"), view, click);
     });
@@ -1369,6 +1457,147 @@ describe("JS", () => {
       JS.exec(event, "click", pop.getAttribute("phx-click"), view, pop);
       jest.runAllTimers();
       expect(document.activeElement).toBe(modal1);
+    });
+
+    test("clears unmatched focus targets when their view is destroyed", () => {
+      const view = setupView(`
+      <div id="modal" tabindex="0">modal</div>
+      <div id="push" phx-click='[["push_focus", {"to": "#modal"}]]'></div>
+      `);
+      const push = document.querySelector("#push")!;
+      const dropFocus = jest.spyOn(JS, "dropFocus");
+
+      JS.exec(event, "click", push.getAttribute("phx-click"), view, push);
+      view.destroy();
+
+      expect(dropFocus).toHaveBeenCalledWith(view);
+      expect(dropFocus).toHaveReturnedWith(1);
+      dropFocus.mockRestore();
+    });
+
+    test("does not pop focus targets owned by a destroyed view", () => {
+      const oldView = setupView(`
+      <div id="modal" tabindex="0">modal</div>
+      <div id="push" phx-click='[["push_focus", {"to": "#modal"}]]'></div>
+      `);
+      const oldModal = document.querySelector<HTMLElement>("#modal")!;
+      const oldPush = document.querySelector("#push")!;
+      const focus = jest.spyOn(oldModal, "focus");
+
+      JS.exec(
+        event,
+        "click",
+        oldPush.getAttribute("phx-click"),
+        oldView,
+        oldPush,
+      );
+      oldView.destroy();
+
+      const newView = setupView(`
+      <div id="new-modal" tabindex="0">new modal</div>
+      <div id="new-push" phx-click='[["push_focus", {"to": "#new-modal"}]]'></div>
+      <div id="pop" phx-click='[["pop_focus", {}]]'></div>
+      `);
+      const newModal = document.querySelector<HTMLElement>("#new-modal")!;
+      const newPush = document.querySelector("#new-push")!;
+      const pop = document.querySelector("#pop")!;
+      const newFocus = jest.spyOn(newModal, "focus");
+
+      JS.exec(
+        event,
+        "click",
+        newPush.getAttribute("phx-click"),
+        newView,
+        newPush,
+      );
+      JS.exec(event, "click", pop.getAttribute("phx-click"), newView, pop);
+      jest.runAllTimers();
+      expect(newFocus).toHaveBeenCalled();
+
+      newFocus.mockClear();
+      JS.exec(event, "click", pop.getAttribute("phx-click"), newView, pop);
+      jest.runAllTimers();
+      expect(focus).not.toHaveBeenCalled();
+      expect(newFocus).not.toHaveBeenCalled();
+    });
+
+    test("does not push focus after the view is destroyed", () => {
+      const oldView = setupView(`
+      <div id="old-modal" tabindex="0">old modal</div>
+      <div id="old-push" phx-remove='[["push_focus", {"to": "#old-modal"}]]'></div>
+      `);
+      const oldModal = document.querySelector<HTMLElement>("#old-modal")!;
+      const oldPush = document.querySelector("#old-push")!;
+      const oldFocus = jest.spyOn(oldModal, "focus");
+
+      oldView.destroy();
+      JS.exec(
+        event,
+        "remove",
+        oldPush.getAttribute("phx-remove"),
+        oldView,
+        oldPush,
+      );
+
+      const newView = setupView(`
+      <div id="new-pop" phx-click='[["pop_focus", {}]]'></div>
+      `);
+      const newPop = document.querySelector("#new-pop")!;
+
+      JS.exec(
+        event,
+        "click",
+        newPop.getAttribute("phx-click"),
+        newView,
+        newPop,
+      );
+      jest.runAllTimers();
+      expect(oldFocus).not.toHaveBeenCalled();
+    });
+
+    test("does not pop focus after the view is destroyed", () => {
+      const oldView = setupView(`
+      <div id="old-pop" phx-remove='[["pop_focus", {}]]'></div>
+      `);
+      const oldPop = document.querySelector("#old-pop")!;
+      oldView.destroy();
+
+      const newView = setupView(`
+      <div id="new-modal" tabindex="0">new modal</div>
+      <div id="new-push" phx-click='[["push_focus", {"to": "#new-modal"}]]'></div>
+      <div id="new-pop" phx-click='[["pop_focus", {}]]'></div>
+      `);
+      const newModal = document.querySelector<HTMLElement>("#new-modal")!;
+      const newPush = document.querySelector("#new-push")!;
+      const newPop = document.querySelector("#new-pop")!;
+      const newFocus = jest.spyOn(newModal, "focus");
+
+      JS.exec(
+        event,
+        "click",
+        newPush.getAttribute("phx-click"),
+        newView,
+        newPush,
+      );
+      JS.exec(
+        event,
+        "remove",
+        oldPop.getAttribute("phx-remove"),
+        oldView,
+        oldPop,
+      );
+      jest.runAllTimers();
+      expect(newFocus).not.toHaveBeenCalled();
+
+      JS.exec(
+        event,
+        "click",
+        newPop.getAttribute("phx-click"),
+        newView,
+        newPop,
+      );
+      jest.runAllTimers();
+      expect(newFocus).toHaveBeenCalled();
     });
   });
 

@@ -12,6 +12,7 @@ import {
   PHX_ERROR_CLASS,
   PHX_SERVER_ERROR_CLASS,
   PHX_HAS_FOCUSED,
+  MAX_CHILD_JOIN_ATTEMPTS,
 } from "phoenix_live_view/constants";
 
 import {
@@ -22,6 +23,7 @@ import {
   liveViewDOM,
   simulateVisibility,
   appendTitle,
+  captureDiagnostics,
 } from "./test_helpers";
 
 const simulateUsedInput = (input) => {
@@ -59,6 +61,81 @@ describe("View + DOM", function () {
 
     expect(view.el.firstChild!["tagName"]).toBe("H2");
     expect(view["rendered"]!.get()).toEqual(updateDiff);
+  });
+
+  test("applies diffs buffered during a join once the join completes", async () => {
+    liveSocket = new LiveSocket("/live", Socket);
+    const el = liveViewDOM("<div>initial</div>");
+    const view = simulateJoinedView(el, liveSocket);
+
+    view.update(
+      {
+        s: ["<section>", "</section>"],
+        0: { s: ["<span>", "</span>"], k: { 0: { 0: "a" }, kc: 1 } },
+      },
+      [],
+    );
+
+    // a diff arrives while the join is still pending
+    view["joinPending"] = true;
+    view.update({ 0: { k: { 0: { 0: "b" }, kc: 1 } } }, []);
+    expect(view["pendingDiffs"].length).toBe(1);
+    expect(view.el.innerHTML).toContain("<span>a</span>");
+
+    view["joinPending"] = false;
+    view.applyPendingUpdates();
+
+    expect(view["pendingDiffs"]).toEqual([]);
+    expect(view.el.innerHTML).toContain("<span>b</span>");
+  });
+
+  test("discards diffs buffered against the tree a rejoin replaced", async () => {
+    liveSocket = new LiveSocket("/live", Socket);
+    const el = liveViewDOM("<div>initial</div>");
+    const view = simulateJoinedView(el, liveSocket);
+
+    // the tree the server computed the next diff against: a keyed comprehension
+    // nested two levels down
+    view.update(
+      {
+        s: ["<section>", "</section>"],
+        0: {
+          s: ["<div>", "</div>"],
+          0: {
+            s: ["<span>", "</span>"],
+            k: { 0: { 0: "a" }, 1: { 0: "b" }, 2: { 0: "c" }, kc: 3 },
+          },
+        },
+      },
+      [],
+    );
+
+    // a broadcast arrives while the join is pending and is buffered: a new entry
+    // at the top, so every other entry moves down one
+    view["joinPending"] = true;
+    view.update(
+      {
+        0: { 0: { k: { 0: { 0: "new" }, 1: 0, 2: 1, 3: 2, kc: 4, km: true } } },
+      },
+      [],
+    );
+    expect(view["pendingDiffs"].length).toBe(1);
+
+    // the view rejoins before that diff is applied. The new LiveView renders a
+    // plain nested struct where the previous one rendered the comprehension, so
+    // merging the buffered diff into it would walk into a subtree that has no
+    // keyed entries at all.
+    view.onJoin({
+      rendered: {
+        s: ["<section>", "</section>"],
+        0: { s: ["<div>", "</div>"], 0: { s: ["<b>", "</b>"], 0: "hello" } },
+      },
+      liveview_version,
+    });
+
+    expect(view["pendingDiffs"]).toEqual([]);
+    expect(view.el.innerHTML).toContain("<b>hello</b>");
+    expect(view.el.innerHTML).not.toContain("new");
   });
 
   test("applyDiff with empty title uses default if present", async () => {
@@ -191,6 +268,76 @@ describe("View + DOM", function () {
     );
 
     expect(view.el.querySelector("form")).toBeTruthy();
+  });
+
+  test("pushWithReply stops page loading when a push errors", async function () {
+    liveSocket = new LiveSocket("/live", Socket);
+    const el = liveViewDOM();
+    const view = simulateJoinedView(el, liveSocket);
+    const events: string[] = [];
+    const pageLoadingListener = (event: Event) => events.push(event.type);
+    window.addEventListener("phx:page-loading-start", pageLoadingListener);
+    window.addEventListener("phx:page-loading-stop", pageLoadingListener);
+
+    const push = {
+      receives: [] as [string, (reason: { reason: string }) => void][],
+      receive(status: string, callback: (reason: { reason: string }) => void) {
+        this.receives.push([status, callback]);
+        return this;
+      },
+    };
+    (view["channel"] as any).push = () => push;
+
+    const result = view.pushWithReply(
+      () => [null, [el], { page_loading: true }],
+      "event",
+      { event: "save" },
+    );
+    push.receives.find(([status]) => status === "error")![1]({
+      reason: "invalid",
+    });
+
+    await expect(result).resolves.toMatchObject({ type: "error" });
+    expect(events).toEqual(["phx:page-loading-start", "phx:page-loading-stop"]);
+
+    window.removeEventListener("phx:page-loading-start", pageLoadingListener);
+    window.removeEventListener("phx:page-loading-stop", pageLoadingListener);
+  });
+
+  test("pushWithReply stops page loading when a push times out", async function () {
+    liveSocket = new LiveSocket("/live", Socket);
+    const el = liveViewDOM();
+    const view = simulateJoinedView(el, liveSocket);
+    const events: string[] = [];
+    const pageLoadingListener = (event: Event) => events.push(event.type);
+    window.addEventListener("phx:page-loading-start", pageLoadingListener);
+    window.addEventListener("phx:page-loading-stop", pageLoadingListener);
+    const reloadWithJitter = jest
+      .spyOn(liveSocket, "reloadWithJitter")
+      .mockImplementation(() => {});
+
+    const push = {
+      receives: [] as [string, () => void][],
+      receive(status: string, callback: () => void) {
+        this.receives.push([status, callback]);
+        return this;
+      },
+    };
+    (view["channel"] as any).push = () => push;
+
+    const result = view.pushWithReply(
+      () => [null, [el], { page_loading: true }],
+      "event",
+      { event: "save" },
+    );
+    push.receives.find(([status]) => status === "timeout")![1]();
+
+    await expect(result).resolves.toMatchObject({ type: "error" });
+    expect(events).toEqual(["phx:page-loading-start", "phx:page-loading-stop"]);
+    expect(reloadWithJitter).toHaveBeenCalledWith(view, expect.any(Function));
+
+    window.removeEventListener("phx:page-loading-start", pageLoadingListener);
+    window.removeEventListener("phx:page-loading-stop", pageLoadingListener);
   });
 
   test("pushEvent", function () {
@@ -453,7 +600,7 @@ describe("View + DOM", function () {
     expect(Object.keys(view.getFormsForRecovery()).length).toBe(0);
 
     html = '<form><input name="foo"></form>';
-    view = new View(liveViewDOM(), liveSocket, null, null, null);
+    view = new View(liveViewDOM(html), liveSocket, null, null, null);
     view.joinCount = 2;
     expect(Object.keys(view.getFormsForRecovery()).length).toBe(0);
 
@@ -471,6 +618,16 @@ describe("View + DOM", function () {
     expect(newForms["my-form"].getAttribute("phx-change")).toBe(
       '[["push",{"event":"update","target":1}]]',
     );
+  });
+
+  test("maybeRecoverForms completes when the join HTML has no element", function () {
+    liveSocket = new LiveSocket("/live", Socket);
+    const view = new View(liveViewDOM(), liveSocket, null, null, null);
+    const callback = jest.fn();
+
+    view.maybeRecoverForms("", callback);
+
+    expect(callback).toHaveBeenCalledTimes(1);
   });
 
   describe("submitForm", function () {
@@ -1290,6 +1447,64 @@ describe("View", function () {
     expect(redirectSpy).toHaveBeenCalledWith({ to: "/redirected" });
   });
 
+  test("onJoinError reports join timeouts separately", () => {
+    liveSocket = new LiveSocket("/live", Socket);
+    const el = liveViewDOM();
+    const view = new View(el, liveSocket, null, null, null);
+    stubChannel(view);
+    const error = { reason: "timeout" };
+    const consoleError = jest
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const { diagnostics, stop } = captureDiagnostics();
+
+    try {
+      view.onJoinError(error);
+    } finally {
+      stop();
+      consoleError.mockRestore();
+    }
+
+    expect(diagnostics).toContainEqual({
+      version: 1,
+      level: "error",
+      code: "view.join-timeout",
+      message: "join timed out",
+      viewId: view.id,
+      metadata: { error },
+      attribution: "network",
+    });
+  });
+
+  test("stops processing after exhausting child join attempts", () => {
+    jest.useFakeTimers();
+    liveSocket = new LiveSocket("/live", Socket);
+    const root = simulateJoinedView(liveViewDOM(), liveSocket);
+    const childEl = document.createElement("div");
+    childEl.id = "child";
+    childEl.setAttribute("data-phx-parent-id", root.id);
+    childEl.setAttribute("data-phx-session", "abc123");
+    childEl.setAttribute("data-phx-static", "");
+    root.el.appendChild(childEl);
+
+    const child = new View(childEl, liveSocket, root, null, null);
+    root["children"]![root.id][child.id] = child;
+    stubChannel(child);
+    child["joinAttempts"] = MAX_CHILD_JOIN_ATTEMPTS;
+    const destroySpy = jest.spyOn(child, "destroy");
+    const displayErrorSpy = jest.spyOn(child, "displayError");
+
+    child.onJoinError({ reason: "error" });
+
+    expect(destroySpy).toHaveBeenCalledTimes(1);
+    expect(displayErrorSpy).not.toHaveBeenCalled();
+    expect(child.isDestroyed()).toBe(true);
+    expect(child["disconnectedTimer"]).toBeNull();
+
+    jest.clearAllTimers();
+    jest.useRealTimers();
+  });
+
   test("sends _track_static and _mounts on params", () => {
     liveSocket = new LiveSocket("/live", Socket);
     const el = liveViewDOM();
@@ -1457,6 +1672,114 @@ describe("View Hooks", function () {
     expect(Object.keys(view["viewHooks"])).toEqual([]);
   });
 
+  test("dynamically added phx-hook is mounted", async () => {
+    let mounted = false;
+    let updated = false;
+    const Hooks = <HooksOptions>{
+      DynHook: {
+        mounted() {
+          mounted = true;
+        },
+        updated() {
+          updated = true;
+        },
+      },
+    };
+    liveSocket = new LiveSocket("/live", Socket, { hooks: Hooks });
+    const el = liveViewDOM();
+
+    const view = simulateJoinedView(el, liveSocket);
+
+    // initial render: element exists but has no phx-hook
+    view.onJoin({
+      rendered: {
+        s: ['<h2 id="dyn">no hook yet</h2>'],
+        fingerprint: 123,
+      },
+      liveview_version,
+    });
+    expect(mounted).toBe(false);
+    expect(Object.keys(view["viewHooks"])).toHaveLength(0);
+
+    // update: element gains phx-hook attribute dynamically
+    view.update(
+      {
+        s: ['<h2 id="dyn" phx-hook="DynHook">now with hook</h2>'],
+        fingerprint: 123,
+      },
+      [],
+    );
+    expect(mounted).toBe(true);
+    expect(Object.keys(view["viewHooks"])).toHaveLength(1);
+    // mounted, not updated — this is the first time the hook is attached
+    expect(updated).toBe(false);
+  });
+
+  test("changing phx-hook", async () => {
+    let dynMounted = false;
+    let dynDestroyed = false;
+    let otherMounted = false;
+    let otherDestroyed = false;
+    const Hooks = <HooksOptions>{
+      DynHook: {
+        mounted() {
+          dynMounted = true;
+        },
+        destroyed() {
+          dynDestroyed = true;
+        },
+      },
+      OtherHook: {
+        mounted() {
+          otherMounted = true;
+        },
+        destroyed() {
+          otherDestroyed = true;
+        },
+      },
+    };
+    liveSocket = new LiveSocket("/live", Socket, { hooks: Hooks });
+    const el = liveViewDOM();
+
+    const view = simulateJoinedView(el, liveSocket);
+
+    // initial render: element exists but has no phx-hook
+    view.onJoin({
+      rendered: {
+        s: ['<h2 id="dyn" phx-hook="DynHook">initial</h2>'],
+        fingerprint: 123,
+      },
+      liveview_version,
+    });
+    expect(dynMounted).toBe(true);
+    expect(dynDestroyed).toBe(false);
+    expect(otherMounted).toBe(false);
+    expect(Object.keys(view["viewHooks"])).toHaveLength(1);
+
+    // update: element gains phx-hook attribute dynamically
+    view.update(
+      {
+        s: ['<h2 id="dyn" phx-hook="OtherHook">now with different hook</h2>'],
+        fingerprint: 123,
+      },
+      [],
+    );
+    expect(dynDestroyed).toBe(true);
+    expect(otherMounted).toBe(true);
+    expect(Object.keys(view["viewHooks"])).toHaveLength(1);
+
+    // update: hook removed altogether
+    view.update(
+      {
+        s: ['<h2 id="dyn">no hook any more</h2>'],
+        fingerprint: 123,
+      },
+      [],
+    );
+    expect(otherDestroyed).toBe(true);
+    expect(Object.keys(view["viewHooks"])).toHaveLength(0);
+  });
+
   test("class based hook", async () => {
     let upcaseWasDestroyed = false;
     let upcaseBeforeUpdate = false;
@@ -1612,8 +1935,21 @@ describe("View Hooks", function () {
     view.showLoader();
     expect(values).toEqual(["mounted", "disconnected"]);
 
+    view.showLoader();
+    // The hook is already disconnected, so it shouldn't receive another
+    // "disconnected" message
+    expect(values).toEqual(["mounted", "disconnected"]);
+
     view.triggerReconnected();
     expect(values).toEqual(["mounted", "disconnected", "reconnected"]);
+
+    view.showLoader();
+    expect(values).toEqual([
+      "mounted",
+      "disconnected",
+      "reconnected",
+      "disconnected",
+    ]);
   });
 
   test("dispatches uploads", async () => {
@@ -1678,6 +2014,134 @@ describe("View Hooks", function () {
     expect(fromHTML).toBe("initial");
     expect(toHTML).toBe("updated");
     expect((view.el.firstChild! as HTMLElement).innerHTML).toBe("updated");
+  });
+
+  test("beforeUpdate receives toEl", async () => {
+    let args: object | null = null;
+    const Hooks = <HooksOptions>{
+      MyHook: {
+        beforeUpdate(toEl) {
+          args = {
+            // el is still the unmodified element in the DOM
+            elHTML: this.el.outerHTML,
+            toHTML: toEl.outerHTML,
+            toIsConnected: document.contains(toEl),
+          };
+        },
+      },
+    };
+    liveSocket = new LiveSocket("/live", Socket, { hooks: Hooks });
+    const el = liveViewDOM();
+    const view = simulateJoinedView(el, liveSocket);
+
+    view.onJoin({
+      rendered: {
+        s: ['<div id="hook" phx-hook="MyHook">initial</div>'],
+        fingerprint: 123,
+      },
+      liveview_version,
+    });
+    expect(args).toBe(null);
+
+    view.update(
+      {
+        s: ['<div id="hook" phx-hook="MyHook" class="x">updated</div>'],
+        fingerprint: 123,
+      },
+      [],
+    );
+
+    expect(args).toEqual({
+      elHTML: '<div id="hook" phx-hook="MyHook">initial</div>',
+      // toEl carries the update that is about to be applied
+      toHTML: '<div id="hook" phx-hook="MyHook" class="x">updated</div>',
+      // and it is detached; it is discarded once the patch is applied
+      toIsConnected: false,
+    });
+  });
+
+  test("beforeUpdate receives new attributes for phx-update=ignore", async () => {
+    let elV: string | undefined;
+    let toV: string | undefined;
+    const Hooks = <HooksOptions>{
+      MyHook: {
+        beforeUpdate(toEl) {
+          elV = this.el.dataset.v;
+          toV = toEl.dataset.v;
+        },
+      },
+    };
+    liveSocket = new LiveSocket("/live", Socket, { hooks: Hooks });
+    const el = liveViewDOM();
+    const view = simulateJoinedView(el, liveSocket);
+
+    view.onJoin({
+      rendered: {
+        s: [
+          '<div id="hook" phx-hook="MyHook" phx-update="ignore" data-v="1">initial</div>',
+        ],
+        fingerprint: 123,
+      },
+      liveview_version,
+    });
+
+    view.update(
+      {
+        s: [
+          '<div id="hook" phx-hook="MyHook" phx-update="ignore" data-v="2">updated</div>',
+        ],
+        fingerprint: 123,
+      },
+      [],
+    );
+
+    // the hook sees the new data attributes before they are merged into el
+    expect(elV).toBe("1");
+    expect(toV).toBe("2");
+    // the content is ignored, but the data attributes are merged
+    expect(el.querySelector("#hook")!.outerHTML).toBe(
+      '<div id="hook" phx-hook="MyHook" phx-update="ignore" data-v="2">initial</div>',
+    );
+  });
+
+  test("beforeUpdate observes toEl changes from dom.onBeforeElUpdated", async () => {
+    let seen: string | null = null;
+    const Hooks = <HooksOptions>{
+      MyHook: {
+        beforeUpdate(toEl) {
+          seen = toEl.getAttribute("data-js-flag");
+        },
+      },
+    };
+    liveSocket = new LiveSocket("/live", Socket, {
+      hooks: Hooks,
+      dom: {
+        onBeforeElUpdated(_from, to) {
+          to.setAttribute("data-js-flag", "set-by-dom-callback");
+        },
+      },
+    });
+    const el = liveViewDOM();
+    const view = simulateJoinedView(el, liveSocket);
+
+    view.onJoin({
+      rendered: {
+        s: ['<div id="hook" phx-hook="MyHook">initial</div>'],
+        fingerprint: 123,
+      },
+      liveview_version,
+    });
+
+    view.update(
+      {
+        s: ['<div id="hook" phx-hook="MyHook">updated</div>'],
+        fingerprint: 123,
+      },
+      [],
+    );
+
+    // onBeforeElUpdated runs before the hook's beforeUpdate
+    expect(seen).toBe("set-by-dom-callback");
   });
 
   test("can overwrite property", async () => {
@@ -1768,7 +2232,7 @@ describe("View + Component", function () {
   });
 
   test("pushEvent", (done) => {
-    expect.assertions(17);
+    expect.assertions(19);
 
     liveSocket = new LiveSocket("/live", Socket);
     const el = liveViewComponent();
@@ -1799,6 +2263,9 @@ describe("View + Component", function () {
     };
     (view as any).channel = channelStub;
 
+    // resolved by the extra element locked via detail.lock() below
+    let extraLockComplete;
+
     input.addEventListener("phx:push:myevent", (e) => {
       const { ref, lockComplete, loadingComplete } = e["detail"];
       expect(ref).toBe(0);
@@ -1809,7 +2276,12 @@ describe("View + Component", function () {
         lockComplete.then((detail) => {
           expect(detail.event).toBe("myevent");
           expect(detail.ref).toBe(0);
-          done();
+          // the promise returned by detail.lock() must settle as well
+          extraLockComplete.then((detail) => {
+            expect(detail.event).toBe("myevent");
+            expect(detail.ref).toBe(0);
+            done();
+          });
         });
       });
     });
@@ -1817,13 +2289,10 @@ describe("View + Component", function () {
       const { lock, unlock, lockComplete } = e["detail"];
       expect(typeof lock).toBe("function");
       expect(view.el.getAttribute("data-phx-ref-lock")).toBe(null);
-      // lock accepts unlock function to fire, which will done() the test
       lockComplete.then((detail) => {
         expect(detail.event).toBe("myevent");
       });
-      lock(view.el).then((detail) => {
-        expect(detail.event).toBe("myevent");
-      });
+      extraLockComplete = lock(view.el);
       expect(e.target).toBe(input);
       expect(input.getAttribute("data-phx-ref-lock")).toBe("0");
       expect(view.el.getAttribute("data-phx-ref-lock")).toBe("0");
